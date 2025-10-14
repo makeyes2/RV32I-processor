@@ -130,7 +130,295 @@ module hart #(
     ,`RVFI_OUTPUTS,
 `endif
 );
-    // Fill in your implementation here.
+    `default_nettype none
+
+    // ========================================================================
+    // Program Counter (PC) Register
+    // ========================================================================
+    reg [31:0] pc;
+    wire [31:0] pc_next;
+
+    always @(posedge i_clk) begin
+        if (i_rst) begin
+            pc <= RESET_ADDR;
+        end else begin
+            pc <= pc_next;
+        end
+    end
+
+    // Connect PC to instruction memory
+    assign o_imem_raddr = pc;
+    wire [31:0] instruction = i_imem_rdata;
+
+    // ========================================================================
+    // Instruction Decode
+    // ========================================================================
+    // Extract instruction fields
+    wire [6:0] opcode = instruction[6:0];
+    wire [4:0] rd     = instruction[11:7];
+    wire [2:0] funct3 = instruction[14:12];
+    wire [4:0] rs1    = instruction[19:15];
+    wire [4:0] rs2    = instruction[24:20];
+    wire [6:0] funct7 = instruction[31:25];
+
+    // Control signals from control unit
+    wire [1:0] u_sel;
+    wire [5:0] i_format;
+    wire [2:0] bj_type;
+    wire [5:0] alu_op;
+    wire mem_read;
+    wire mem_to_reg;
+    wire mem_write;
+    wire alu_src;
+    wire reg_write;
+
+    // Instantiate control unit
+    ctl control_unit (
+        .instruction(opcode),
+        .U_sel(u_sel),
+        .i_format(i_format),
+        .bj_type(bj_type),
+        .alu_op(alu_op),
+        .mem_read(mem_read),
+        .mem_to_reg(mem_to_reg),
+        .mem_write(mem_write),
+        .alu_src(alu_src),
+        .reg_write(reg_write)
+    );
+
+    // ========================================================================
+    // Immediate Generation
+    // ========================================================================
+    wire [31:0] immediate;
+
+    imm imm_gen (
+        .i_inst(instruction),
+        .i_format(i_format),
+        .o_immediate(immediate)
+    );
+
+    // ========================================================================
+    // Register File
+    // ========================================================================
+    wire [31:0] rs1_data;
+    wire [31:0] rs2_data;
+    wire [31:0] rd_wdata;
+
+    rf #(.BYPASS_EN(0)) register_file (
+        .i_clk(i_clk),
+        .i_rst(i_rst),
+        .i_rs1_raddr(rs1),
+        .o_rs1_rdata(rs1_data),
+        .i_rs2_raddr(rs2),
+        .o_rs2_rdata(rs2_data),
+        .i_rd_wen(reg_write),
+        .i_rd_waddr(rd),
+        .i_rd_wdata(rd_wdata)
+    );
+
+    // ========================================================================
+    // ALU Control
+    // ========================================================================
+    wire [2:0] alu_opsel;
+    wire alu_sub;
+    wire alu_unsigned;
+    wire alu_arith;
+
+    alu_ctl alu_control (
+        .alu_op(alu_op),
+        .instruction(instruction),
+        .i_opsel(alu_opsel),
+        .i_sub(alu_sub),
+        .i_unsigned(alu_unsigned),
+        .i_arith(alu_arith)
+    );
+
+    // ========================================================================
+    // ALU
+    // ========================================================================
+    wire [31:0] alu_op1;
+    wire [31:0] alu_op2;
+    wire [31:0] alu_result;
+    wire alu_eq;
+    wire alu_slt;
+
+    // ALU operand selection
+    assign alu_op1 = rs1_data;
+    assign alu_op2 = alu_src ? immediate : rs2_data;
+
+    alu alu_unit (
+        .i_opsel(alu_opsel),
+        .i_sub(alu_sub),
+        .i_unsigned(alu_unsigned),
+        .i_arith(alu_arith),
+        .i_op1(alu_op1),
+        .i_op2(alu_op2),
+        .o_result(alu_result),
+        .o_eq(alu_eq),
+        .o_slt(alu_slt)
+    );
+
+    // ========================================================================
+    // Branch Logic
+    // ========================================================================
+    wire is_branch = (bj_type != 3'b000) && (opcode == 7'b1100011);
+    wire is_jal    = (opcode == 7'b1101111);
+    wire is_jalr   = (opcode == 7'b1100111);
+
+    // Branch comparison logic
+    reg branch_taken;
+    always @(*) begin
+        case (bj_type)
+            3'b001: branch_taken = alu_eq;           // BEQ
+            3'b010: branch_taken = ~alu_eq;          // BNE
+            3'b011: branch_taken = alu_slt;          // BLT (signed)
+            3'b100: branch_taken = ~alu_slt & ~alu_eq; // BGE (signed)
+            3'b101: branch_taken = alu_slt;          // BLTU (unsigned)
+            3'b110: branch_taken = ~alu_slt & ~alu_eq; // BGEU (unsigned)
+            default: branch_taken = 1'b0;
+        endcase
+    end
+
+    // ========================================================================
+    // PC Update Logic
+    // ========================================================================
+    wire [31:0] pc_plus_4 = pc + 32'd4;
+    wire [31:0] branch_target = pc + immediate;
+    wire [31:0] jalr_target = (rs1_data + immediate) & ~32'd1;  // Clear LSB
+
+    // PC selection logic
+    assign pc_next = (is_branch && branch_taken) ? branch_target :
+                     is_jal                       ? branch_target :
+                     is_jalr                      ? jalr_target :
+                                                    pc_plus_4;
+
+    // ========================================================================
+    // Data Memory Interface
+    // ========================================================================
+    // Memory address calculation (must be word-aligned)
+    wire [31:0] mem_addr_unaligned = alu_result;
+    wire [31:0] mem_addr_aligned = {mem_addr_unaligned[31:2], 2'b00};
+    wire [1:0]  mem_byte_offset = mem_addr_unaligned[1:0];
+
+    // Generate byte mask based on funct3 (load/store size) and byte offset
+    reg [3:0] byte_mask;
+    always @(*) begin
+        case (funct3[1:0])  // funct3[1:0] determines size
+            2'b00: begin  // Byte access (LB/LBU/SB)
+                case (mem_byte_offset)
+                    2'b00: byte_mask = 4'b0001;
+                    2'b01: byte_mask = 4'b0010;
+                    2'b10: byte_mask = 4'b0100;
+                    2'b11: byte_mask = 4'b1000;
+                endcase
+            end
+            2'b01: begin  // Halfword access (LH/LHU/SH)
+                case (mem_byte_offset[1])
+                    1'b0: byte_mask = 4'b0011;
+                    1'b1: byte_mask = 4'b1100;
+                endcase
+            end
+            2'b10: begin  // Word access (LW/SW)
+                byte_mask = 4'b1111;
+            end
+            default: byte_mask = 4'b0000;
+        endcase
+    end
+
+    // Store data alignment: shift rs2_data to correct byte lane
+    reg [31:0] store_data_aligned;
+    always @(*) begin
+        case (funct3[1:0])
+            2'b00: begin  // Byte store
+                case (mem_byte_offset)
+                    2'b00: store_data_aligned = {24'b0, rs2_data[7:0]};
+                    2'b01: store_data_aligned = {16'b0, rs2_data[7:0], 8'b0};
+                    2'b10: store_data_aligned = {8'b0, rs2_data[7:0], 16'b0};
+                    2'b11: store_data_aligned = {rs2_data[7:0], 24'b0};
+                endcase
+            end
+            2'b01: begin  // Halfword store
+                case (mem_byte_offset[1])
+                    1'b0: store_data_aligned = {16'b0, rs2_data[15:0]};
+                    1'b1: store_data_aligned = {rs2_data[15:0], 16'b0};
+                endcase
+            end
+            2'b10: begin  // Word store
+                store_data_aligned = rs2_data;
+            end
+            default: store_data_aligned = 32'b0;
+        endcase
+    end
+
+    // Load data alignment and sign extension
+    reg [31:0] load_data_extended;
+    wire mem_unsigned = funct3[2];  // funct3[2] = 1 for unsigned loads
+    always @(*) begin
+        case (funct3[1:0])
+            2'b00: begin  // Byte load
+                case (mem_byte_offset)
+                    2'b00: load_data_extended = mem_unsigned ? {24'b0, i_dmem_rdata[7:0]} :
+                                                               {{24{i_dmem_rdata[7]}}, i_dmem_rdata[7:0]};
+                    2'b01: load_data_extended = mem_unsigned ? {24'b0, i_dmem_rdata[15:8]} :
+                                                               {{24{i_dmem_rdata[15]}}, i_dmem_rdata[15:8]};
+                    2'b10: load_data_extended = mem_unsigned ? {24'b0, i_dmem_rdata[23:16]} :
+                                                               {{24{i_dmem_rdata[23]}}, i_dmem_rdata[23:16]};
+                    2'b11: load_data_extended = mem_unsigned ? {24'b0, i_dmem_rdata[31:24]} :
+                                                               {{24{i_dmem_rdata[31]}}, i_dmem_rdata[31:24]};
+                endcase
+            end
+            2'b01: begin  // Halfword load
+                case (mem_byte_offset[1])
+                    1'b0: load_data_extended = mem_unsigned ? {16'b0, i_dmem_rdata[15:0]} :
+                                                              {{16{i_dmem_rdata[15]}}, i_dmem_rdata[15:0]};
+                    1'b1: load_data_extended = mem_unsigned ? {16'b0, i_dmem_rdata[31:16]} :
+                                                              {{16{i_dmem_rdata[31]}}, i_dmem_rdata[31:16]};
+                endcase
+            end
+            2'b10: begin  // Word load
+                load_data_extended = i_dmem_rdata;
+            end
+            default: load_data_extended = 32'b0;
+        endcase
+    end
+
+    // Data memory outputs
+    assign o_dmem_addr = mem_addr_aligned;
+    assign o_dmem_ren = mem_read;
+    assign o_dmem_wen = mem_write;
+    assign o_dmem_mask = byte_mask;
+    assign o_dmem_wdata = store_data_aligned;
+
+    // ========================================================================
+    // Writeback Mux
+    // ========================================================================
+    // Determine writeback data source
+    wire is_lui = (opcode == 7'b0110111);
+    wire is_auipc = (opcode == 7'b0010111);
+    wire write_pc_plus_4 = is_jal || is_jalr;
+
+    assign rd_wdata = write_pc_plus_4 ? pc_plus_4 :
+                      is_lui          ? immediate :
+                      is_auipc        ? (pc + immediate) :
+                      mem_to_reg      ? load_data_extended :
+                                        alu_result;
+
+    // ========================================================================
+    // Retire Interface (for testbench)
+    // ========================================================================
+    assign o_retire_valid = 1'b1;  // Single-cycle: always retiring
+    assign o_retire_inst = instruction;
+    assign o_retire_trap = 1'b0;  // No traps in basic implementation
+    assign o_retire_halt = 1'b0;  // No halt in basic implementation
+    assign o_retire_rs1_raddr = rs1;
+    assign o_retire_rs2_raddr = rs2;
+    assign o_retire_rs1_rdata = rs1_data;
+    assign o_retire_rs2_rdata = rs2_data;
+    assign o_retire_rd_waddr = rd;
+    assign o_retire_rd_wdata = rd_wdata;
+    assign o_retire_pc = pc;
+    assign o_retire_next_pc = pc_next;
+
 endmodule
 
 `default_nettype wire
